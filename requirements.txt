@@ -1,0 +1,6 @@
+django>=5.0
+djangorestframework>=3.15
+django-cors-headers>=4.3
+qrcode[pil]>=7.4
+Pillow>=10.0
+psycopg2-binary>=2.9
