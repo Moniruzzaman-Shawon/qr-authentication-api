@@ -17,6 +17,13 @@ class ScanRecord(models.Model):
 
     class Meta:
         ordering = ['-scanned_at']
+        indexes = [
+            # customer_email is grouped/filtered by the customer endpoints;
+            # the composite supports the "latest scan per customer" subquery.
+            models.Index(fields=['customer_email', '-scanned_at']),
+            # is_first_scan + scanned_at back the dashboard/fraud listings.
+            models.Index(fields=['is_first_scan', '-scanned_at']),
+        ]
         constraints = [
             # A product can have at most one genuine (first) scan — this is the
             # database-level guarantee that backs the "one-time QR" promise and

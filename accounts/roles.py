@@ -21,7 +21,9 @@ def get_role(user):
         return None
     if user.is_superuser:
         return ADMIN
-    names = set(user.groups.values_list('name', flat=True))
+    # Iterate groups.all() (not values_list) so a prefetch_related('groups')
+    # cache is reused — avoids an extra query per user when serialising lists.
+    names = {g.name for g in user.groups.all()}
     if ADMIN in names:
         return ADMIN
     if OPERATOR in names:

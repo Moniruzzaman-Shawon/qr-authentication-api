@@ -2,6 +2,7 @@ import io
 import zipfile
 import qrcode
 from django.core.files.base import ContentFile
+from django.db import transaction
 from django.db.models import Count
 from django.http import HttpResponse
 from django.utils import timezone
@@ -23,8 +24,17 @@ from .serializers import (
 
 
 def _product_qs():
-    """Base queryset with scan_count annotated to avoid per-row COUNT queries."""
-    return Product.objects.annotate(_scan_count=Count('scan_records'))
+    """Base queryset tuned for list/detail rendering.
+
+    - annotate scan_count so each row doesn't fire its own COUNT
+    - select_related the FKs the serializers traverse (activated_by.username,
+      catalog) so a list of N products is a single query, not 1 + N.
+    """
+    return (
+        Product.objects
+        .select_related('activated_by', 'catalog')
+        .annotate(_scan_count=Count('scan_records'))
+    )
 
 
 def _paginate(request, queryset, serializer_cls):
@@ -126,17 +136,19 @@ def bulk_create_products(request):
         )
 
     created_products = []
-    for i in range(1, quantity + 1):
-        batch_number = f"{batch_prefix}-{i:04d}"
-        product = Product.objects.create(
-            catalog=catalog,
-            product_name=product_name,
-            brand=brand,
-            batch_number=batch_number,
-            manufactured_date=manufactured_date,
-        )
-        _generate_qr(product)
-        created_products.append(product)
+    with transaction.atomic():
+        for i in range(1, quantity + 1):
+            batch_number = f"{batch_prefix}-{i:04d}"
+            product = Product.objects.create(
+                catalog=catalog,
+                product_name=product_name,
+                brand=brand,
+                batch_number=batch_number,
+                manufactured_date=manufactured_date,
+            )
+            _generate_qr(product)
+            product._scan_count = 0  # avoid a per-row COUNT when serialising
+            created_products.append(product)
 
     serializer = ProductListSerializer(created_products, many=True)
     return Response({
@@ -159,8 +171,21 @@ def bulk_create_csv(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    # Guard against oversized uploads exhausting memory (read fully below).
+    if csv_file.size > 5 * 1024 * 1024:
+        return Response(
+            {'error': 'CSV file too large (max 5 MB).'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     import csv
-    decoded = csv_file.read().decode('utf-8').splitlines()
+    try:
+        decoded = csv_file.read().decode('utf-8').splitlines()
+    except UnicodeDecodeError:
+        return Response(
+            {'error': 'CSV must be UTF-8 encoded.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     reader = csv.DictReader(decoded)
 
     created_products = []
@@ -200,11 +225,13 @@ def bulk_create_csv(request):
 def download_qr_codes(request):
     """Download QR codes as a ZIP file. Query param `ids` = comma-separated UUIDs."""
     ids = request.query_params.get('ids')
+    # Only the columns the ZIP actually needs — avoids dragging every field per row.
+    base = Product.objects.only('id', 'batch_number', 'qr_code_image')
     if ids:
         id_list = [i.strip() for i in ids.split(',') if i.strip()]
-        products = Product.objects.filter(id__in=id_list)
+        products = base.filter(id__in=id_list)
     else:
-        products = Product.objects.all()
+        products = base.all()
 
     if not products.exists():
         return Response(
@@ -214,7 +241,7 @@ def download_qr_codes(request):
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for product in products:
+        for product in products.iterator():
             if product.qr_code_image:
                 try:
                     img_data = product.qr_code_image.read()

@@ -49,7 +49,8 @@ def me_view(request):
 @permission_classes([IsAdmin])
 def user_list_create(request):
     if request.method == 'GET':
-        users = User.objects.all().order_by('username')
+        # prefetch groups so UserSerializer.get_role doesn't query per user.
+        users = User.objects.prefetch_related('groups').order_by('username')
         return Response(UserSerializer(users, many=True).data)
 
     serializer = UserCreateSerializer(data=request.data)

@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Count, Max, Min
+from django.db.models import Count, Max, Min, OuterRef, Q, Subquery
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
@@ -281,10 +281,18 @@ def fraud_alerts(request):
 @permission_classes([IsAdminOrOperator])
 def customer_list(request):
     """List unique customers grouped by email with aggregated scan data."""
+    # Latest name/phone per customer via a correlated subquery, so the whole
+    # listing is a single query instead of 1 + one lookup per distinct customer.
+    latest = ScanRecord.objects.filter(
+        customer_email=OuterRef('customer_email')
+    ).order_by('-scanned_at')
+
     customers = (
         ScanRecord.objects
         .values('customer_email')
         .annotate(
+            name=Subquery(latest.values('customer_name')[:1]),
+            phone=Subquery(latest.values('customer_phone')[:1]),
             total_scans=Count('id'),
             products_verified=Count('product', distinct=True),
             first_scan=Min('scanned_at'),
@@ -293,20 +301,18 @@ def customer_list(request):
         .order_by('-last_scan')
     )
 
-    result = []
-    for c in customers:
-        latest = ScanRecord.objects.filter(
-            customer_email=c['customer_email']
-        ).order_by('-scanned_at').first()
-        result.append({
+    result = [
+        {
             'email': c['customer_email'],
-            'name': latest.customer_name if latest else '',
-            'phone': latest.customer_phone if latest else '',
+            'name': c['name'] or '',
+            'phone': c['phone'] or '',
             'total_scans': c['total_scans'],
             'products_verified': c['products_verified'],
             'first_scan': c['first_scan'],
             'last_scan': c['last_scan'],
-        })
+        }
+        for c in customers
+    ]
 
     return Response(result)
 
@@ -327,13 +333,21 @@ def customer_detail(request, email):
     latest = scans.first()
     scan_data = ScanRecordSerializer(scans, many=True).data
 
+    # One aggregate query instead of four separate COUNT round-trips.
+    agg = scans.aggregate(
+        total_scans=Count('id'),
+        products_verified=Count('product', distinct=True),
+        genuine_scans=Count('id', filter=Q(is_first_scan=True)),
+        suspicious_scans=Count('id', filter=Q(is_first_scan=False)),
+    )
+
     return Response({
         'email': email,
         'name': latest.customer_name,
         'phone': latest.customer_phone,
-        'total_scans': scans.count(),
-        'products_verified': scans.values('product').distinct().count(),
-        'genuine_scans': scans.filter(is_first_scan=True).count(),
-        'suspicious_scans': scans.filter(is_first_scan=False).count(),
+        'total_scans': agg['total_scans'],
+        'products_verified': agg['products_verified'],
+        'genuine_scans': agg['genuine_scans'],
+        'suspicious_scans': agg['suspicious_scans'],
         'scans': scan_data,
     })
