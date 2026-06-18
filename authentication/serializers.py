@@ -12,7 +12,7 @@ class ScanRecordSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'product', 'product_name', 'product_brand', 'product_batch',
             'customer_email', 'customer_name', 'customer_phone',
-            'ip_address', 'user_agent', 'location',
+            'ip_address', 'user_agent',
             'is_first_scan', 'scanned_at',
         ]
 

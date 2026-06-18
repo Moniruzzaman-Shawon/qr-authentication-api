@@ -1,46 +1,63 @@
 import io
-import os
 import zipfile
 import qrcode
 from django.core.files.base import ContentFile
+from django.db.models import Count
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
-from .models import Product
+
+from accounts.permissions import IsAdmin, IsAdminOrOperator
+from accounts.roles import is_admin
+from core.pagination import StandardPagination
+from .models import CatalogProduct, Product
+from .qr import build_verify_url
 from .serializers import (
+    CatalogProductSerializer,
     ProductListSerializer,
     ProductCreateSerializer,
     ProductDetailSerializer,
 )
 
 
+def _product_qs():
+    """Base queryset with scan_count annotated to avoid per-row COUNT queries."""
+    return Product.objects.annotate(_scan_count=Count('scan_records'))
+
+
+def _paginate(request, queryset, serializer_cls):
+    paginator = StandardPagination()
+    page = paginator.paginate_queryset(queryset, request)
+    serializer = serializer_cls(page, many=True, context={'request': request})
+    return paginator.get_paginated_response(serializer.data)
+
+
 @api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrOperator])
 def product_list_create(request):
     if request.method == 'GET':
-        products = Product.objects.all().order_by('-created_at')
-        serializer = ProductListSerializer(products, many=True)
-        return Response(serializer.data)
+        products = _product_qs().order_by('-created_at')
+        return _paginate(request, products, ProductListSerializer)
 
-    if request.method == 'POST':
-        serializer = ProductCreateSerializer(data=request.data)
-        if serializer.is_valid():
-            product = serializer.save()
-            _generate_qr(product)
-
-            return Response(
-                ProductListSerializer(product).data,
-                status=status.HTTP_201_CREATED,
-            )
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://192.168.1.3:5173')
+    # POST -> create (Admin only)
+    if not is_admin(request.user):
+        return Response({'detail': 'Admin role required.'}, status=status.HTTP_403_FORBIDDEN)
+    serializer = ProductCreateSerializer(data=request.data)
+    if serializer.is_valid():
+        product = serializer.save()
+        _generate_qr(product)
+        return Response(
+            ProductListSerializer(product).data,
+            status=status.HTTP_201_CREATED,
+        )
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 def _generate_qr(product):
-    """Generate QR code for a product and save it."""
-    verify_url = f"{FRONTEND_URL}/verify/{product.id}"
+    """Generate a signed QR code for a product and save it."""
+    verify_url = build_verify_url(product.id)
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -61,26 +78,36 @@ def _generate_qr(product):
 
 
 @api_view(['POST'])
+@permission_classes([IsAdmin])
 def bulk_create_products(request):
     """
-    Bulk create products with auto-incrementing batch numbers.
-    Body: {
-        product_name: str,
-        brand: str (optional),
-        batch_prefix: str (e.g. "BATCH-2026"),
-        manufactured_date: str (YYYY-MM-DD),
-        quantity: int (1-500)
-    }
+    Generate QR-coded units for a catalog product, with auto-incrementing batch numbers.
+    Body: {catalog (id), batch_prefix, manufactured_date, quantity (1-500)}
+    (product_name/brand may be passed instead of catalog for backward compatibility.)
     """
+    catalog_id = request.data.get('catalog')
+    catalog = None
     product_name = request.data.get('product_name')
     brand = request.data.get('brand', 'Rahman Trades Bangladesh')
+
+    if catalog_id:
+        try:
+            catalog = CatalogProduct.objects.get(id=catalog_id)
+        except (CatalogProduct.DoesNotExist, ValueError, TypeError):
+            return Response(
+                {'error': 'Selected catalog product was not found.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        product_name = catalog.name
+        brand = catalog.brand
+
     batch_prefix = request.data.get('batch_prefix', 'BATCH')
     manufactured_date = request.data.get('manufactured_date')
     quantity = request.data.get('quantity', 1)
 
     if not product_name or not manufactured_date:
         return Response(
-            {'error': 'product_name and manufactured_date are required.'},
+            {'error': 'Select a catalog product and a manufactured date.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -102,6 +129,7 @@ def bulk_create_products(request):
     for i in range(1, quantity + 1):
         batch_number = f"{batch_prefix}-{i:04d}"
         product = Product.objects.create(
+            catalog=catalog,
             product_name=product_name,
             brand=brand,
             batch_number=batch_number,
@@ -118,6 +146,7 @@ def bulk_create_products(request):
 
 
 @api_view(['POST'])
+@permission_classes([IsAdmin])
 def bulk_create_csv(request):
     """
     Bulk create products from CSV upload.
@@ -137,10 +166,10 @@ def bulk_create_csv(request):
     created_products = []
     errors = []
     for row_num, row in enumerate(reader, start=2):
-        product_name = row.get('product_name', '').strip()
-        brand = row.get('brand', 'Rahman Trades Bangladesh').strip()
-        batch_number = row.get('batch_number', '').strip()
-        manufactured_date = row.get('manufactured_date', '').strip()
+        product_name = (row.get('product_name') or '').strip()
+        brand = (row.get('brand') or 'Rahman Trades Bangladesh').strip()
+        batch_number = (row.get('batch_number') or '').strip()
+        manufactured_date = (row.get('manufactured_date') or '').strip()
 
         if not product_name or not batch_number or not manufactured_date:
             errors.append(f"Row {row_num}: missing required fields")
@@ -167,12 +196,9 @@ def bulk_create_csv(request):
 
 
 @api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
 def download_qr_codes(request):
-    """
-    Download QR codes as a ZIP file.
-    Query params:
-        ids: comma-separated product UUIDs (optional, downloads all if omitted)
-    """
+    """Download QR codes as a ZIP file. Query param `ids` = comma-separated UUIDs."""
     ids = request.query_params.get('ids')
     if ids:
         id_list = [i.strip() for i in ids.split(',') if i.strip()]
@@ -204,10 +230,67 @@ def download_qr_codes(request):
     return response
 
 
-@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-def product_detail(request, product_id):
+def _activate(product, user):
+    """Transition a single product PRINTED -> ACTIVE. Returns (ok, message)."""
+    if product.status != Product.STATUS_PRINTED:
+        return False, f'already {product.get_status_display().lower()}'
+    if not product.is_active:
+        return False, 'product is disabled'
+    product.status = Product.STATUS_ACTIVE
+    product.activated_at = timezone.now()
+    product.activated_by = user
+    product.save(update_fields=['status', 'activated_at', 'activated_by', 'updated_at'])
+    return True, 'activated'
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminOrOperator])
+def activate_product(request, product_id):
+    """Point-of-sale activation: PRINTED -> ACTIVE (Admin or Operator)."""
     try:
         product = Product.objects.get(id=product_id)
+    except Product.DoesNotExist:
+        return Response({'detail': 'Product not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    ok, message = _activate(product, request.user)
+    if not ok:
+        return Response(
+            {'status': 'error', 'message': f'Cannot activate: {message}.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(ProductListSerializer(product).data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminOrOperator])
+def bulk_activate_products(request):
+    """Activate many products at once. Body: {ids: [uuid, ...]}."""
+    ids = request.data.get('ids') or []
+    if not isinstance(ids, list) or not ids:
+        return Response(
+            {'error': 'Provide a non-empty "ids" list.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    activated, skipped = [], []
+    for product in Product.objects.filter(id__in=ids):
+        ok, message = _activate(product, request.user)
+        (activated if ok else skipped).append(
+            {'id': str(product.id), 'batch_number': product.batch_number, 'result': message}
+        )
+    return Response({
+        'activated_count': len(activated),
+        'skipped_count': len(skipped),
+        'activated': activated,
+        'skipped': skipped,
+    })
+
+
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@permission_classes([IsAdminOrOperator])
+def product_detail(request, product_id):
+    try:
+        product = _product_qs().get(id=product_id)
     except Product.DoesNotExist:
         return Response(
             {'error': 'Product not found'},
@@ -217,6 +300,10 @@ def product_detail(request, product_id):
     if request.method == 'GET':
         serializer = ProductDetailSerializer(product)
         return Response(serializer.data)
+
+    # Writes (PUT/PATCH/DELETE) are Admin only.
+    if not is_admin(request.user):
+        return Response({'detail': 'Admin role required.'}, status=status.HTTP_403_FORBIDDEN)
 
     if request.method in ('PUT', 'PATCH'):
         partial = request.method == 'PATCH'
@@ -231,3 +318,56 @@ def product_detail(request, product_id):
     if request.method == 'DELETE':
         product.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Catalog (named products the admin curates)
+# ---------------------------------------------------------------------------
+def _catalog_qs():
+    return CatalogProduct.objects.annotate(_unit_count=Count('units'))
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAdminOrOperator])
+def catalog_list_create(request):
+    if request.method == 'GET':
+        catalog = _catalog_qs().order_by('name')
+        return _paginate(request, catalog, CatalogProductSerializer)
+
+    # POST -> create (Admin only)
+    if not is_admin(request.user):
+        return Response({'detail': 'Admin role required.'}, status=status.HTTP_403_FORBIDDEN)
+    serializer = CatalogProductSerializer(data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@permission_classes([IsAdminOrOperator])
+def catalog_detail(request, catalog_id):
+    try:
+        catalog = _catalog_qs().get(id=catalog_id)
+    except CatalogProduct.DoesNotExist:
+        return Response({'detail': 'Catalog product not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(CatalogProductSerializer(catalog).data)
+
+    # Writes are Admin only.
+    if not is_admin(request.user):
+        return Response({'detail': 'Admin role required.'}, status=status.HTTP_403_FORBIDDEN)
+
+    if request.method in ('PUT', 'PATCH'):
+        serializer = CatalogProductSerializer(
+            catalog, data=request.data, partial=request.method == 'PATCH'
+        )
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    # DELETE -> units keep working (catalog FK is SET_NULL; names already denormalised).
+    catalog.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)

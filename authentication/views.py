@@ -1,12 +1,27 @@
+from django.db import transaction
 from django.db.models import Count, Max, Min
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
+from accounts.permissions import IsAdminOrOperator
+from core.pagination import StandardPagination
+from notifications.services import notify_customer_genuine, notify_suspicious_scan
 from products.models import Product
+from products.qr import verify_signature
 from .models import ScanRecord
 from .serializers import ScanRecordSerializer, VerifyRequestSerializer
+
+
+class VerifyThrottle(ScopedRateThrottle):
+    scope = 'verify'
+
+
+class CheckThrottle(ScopedRateThrottle):
+    scope = 'check'
 
 
 def _get_client_ip(request):
@@ -17,48 +32,84 @@ def _get_client_ip(request):
 
 
 def _mask_email(email):
-    """Mask email for privacy: j***@email.com"""
-    local, domain = email.split('@')
-    if len(local) <= 1:
-        masked_local = local[0] + '***'
-    else:
-        masked_local = local[0] + '***'
-    return f"{masked_local}@{domain}"
+    """Mask an email for privacy: 'john@email.com' -> 'j***@email.com'."""
+    if not email or '@' not in email:
+        return 'unknown'
+    local, _, domain = email.partition('@')
+    first = local[0] if local else '*'
+    return f"{first}***@{domain}"
+
+
+def _record_scan(product, data, request, is_first):
+    return ScanRecord.objects.create(
+        product=product,
+        customer_email=data['email'],
+        customer_name=data['name'],
+        customer_phone=data.get('phone', ''),
+        ip_address=_get_client_ip(request),
+        user_agent=request.META.get('HTTP_USER_AGENT', ''),
+        is_first_scan=is_first,
+    )
 
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([VerifyThrottle])
 def verify_product(request, product_id):
-    # Validate request body
+    """Customer-facing verification with two-phase activation.
+
+    PRINTED  -> not activated / not authorised for sale (alert)
+    ACTIVE   -> GENUINE (records first scan, transitions to VERIFIED)
+    VERIFIED/FLAGGED -> SUSPICIOUS (records fraud attempt, transitions to FLAGGED)
+    """
     serializer = VerifyRequestSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    # Look up product
-    try:
-        product = Product.objects.get(id=product_id)
-    except Product.DoesNotExist:
-        return Response(
-            {'status': 'error', 'message': 'Product not found. This QR code may be invalid.'},
-            status=status.HTTP_404_NOT_FOUND,
-        )
-
     data = serializer.validated_data
-    ip_address = _get_client_ip(request)
-    user_agent = request.META.get('HTTP_USER_AGENT', '')
 
-    current_scan_count = product.scan_count
-
-    if current_scan_count == 0:
-        # GENUINE - first scan
-        scan_record = ScanRecord.objects.create(
-            product=product,
-            customer_email=data['email'],
-            customer_name=data['name'],
-            customer_phone=data.get('phone', ''),
-            ip_address=ip_address,
-            user_agent=user_agent,
-            is_first_scan=True,
+    # Reject tampered / unsigned QR payloads.
+    if not verify_signature(product_id, request.query_params.get('sig')):
+        return Response(
+            {'status': 'error', 'message': 'Invalid or unsigned QR code.'},
+            status=status.HTTP_400_BAD_REQUEST,
         )
+
+    # Lock the product row so concurrent scans are serialised.
+    with transaction.atomic():
+        try:
+            product = Product.objects.select_for_update().get(id=product_id)
+        except Product.DoesNotExist:
+            return Response(
+                {'status': 'error', 'message': 'Product not found. This QR code may be invalid.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Recalled / disabled product.
+        if not product.is_active:
+            scan = _record_scan(product, data, request, is_first=False)
+            outcome = ('disabled', scan)
+        elif product.status == Product.STATUS_PRINTED:
+            # Not yet activated for sale — scanning this is itself a red flag.
+            scan = _record_scan(product, data, request, is_first=False)
+            outcome = ('not_activated', scan)
+        elif product.status == Product.STATUS_ACTIVE:
+            # GENUINE: first legitimate scan.
+            scan = _record_scan(product, data, request, is_first=True)
+            product.status = Product.STATUS_VERIFIED
+            product.save(update_fields=['status', 'updated_at'])
+            outcome = ('genuine', scan)
+        else:
+            # Already VERIFIED or FLAGGED -> suspicious.
+            scan = _record_scan(product, data, request, is_first=False)
+            if product.status != Product.STATUS_FLAGGED:
+                product.status = Product.STATUS_FLAGGED
+                product.save(update_fields=['status', 'updated_at'])
+            outcome = ('suspicious', scan)
+
+    result, scan_record = outcome
+
+    if result == 'genuine':
+        notify_customer_genuine(product, scan_record)
         return Response({
             'status': 'genuine',
             'message': 'This is an authentic product. Thank you for verifying!',
@@ -70,36 +121,15 @@ def verify_product(request, product_id):
             },
             'verified_at': scan_record.scanned_at.isoformat(),
         })
-    else:
-        # SUSPICIOUS - already scanned before
-        first_scan = product.scan_records.filter(is_first_scan=True).first()
-        first_scanned_at = first_scan.scanned_at if first_scan else None
-        first_scanned_email = first_scan.customer_email if first_scan else 'unknown'
 
-        # Still create a record to track the fraud attempt
-        ScanRecord.objects.create(
-            product=product,
-            customer_email=data['email'],
-            customer_name=data['name'],
-            customer_phone=data.get('phone', ''),
-            ip_address=ip_address,
-            user_agent=user_agent,
-            is_first_scan=False,
-        )
-
-        first_date_str = ''
-        if first_scanned_at:
-            first_date_str = first_scanned_at.strftime('%B %d, %Y')
-
+    if result == 'not_activated':
+        notify_suspicious_scan(product, scan_record, reason='not_activated')
         return Response({
-            'status': 'suspicious',
+            'status': 'not_activated',
             'message': (
-                f'\u26a0\ufe0f WARNING: This code was already verified on {first_date_str}. '
-                f'If this was not you, this product may be counterfeit.'
+                'This product has not been activated for sale. It may be stolen or '
+                'counterfeit. Please contact the seller.'
             ),
-            'first_scanned_at': first_scanned_at.isoformat() if first_scanned_at else None,
-            'first_scanned_by': _mask_email(first_scanned_email),
-            'scan_count': current_scan_count + 1,  # include the one we just created
             'product': {
                 'name': product.product_name,
                 'brand': product.brand,
@@ -107,9 +137,51 @@ def verify_product(request, product_id):
             },
         })
 
+    if result == 'disabled':
+        notify_suspicious_scan(product, scan_record, reason='not_activated')
+        return Response({
+            'status': 'suspicious',
+            'message': 'This product has been recalled or deactivated. Do not use it.',
+            'product': {
+                'name': product.product_name,
+                'brand': product.brand,
+                'batch_number': product.batch_number,
+            },
+        })
+
+    # suspicious
+    first_scan = product.scan_records.filter(is_first_scan=True).first()
+    first_scanned_at = first_scan.scanned_at if first_scan else None
+    first_email = first_scan.customer_email if first_scan else 'unknown'
+    first_date_str = first_scanned_at.strftime('%B %d, %Y') if first_scanned_at else ''
+    notify_suspicious_scan(product, scan_record, reason='repeat_scan')
+
+    return Response({
+        'status': 'suspicious',
+        'message': (
+            f'⚠️ WARNING: This code was already verified on {first_date_str}. '
+            f'If this was not you, this product may be counterfeit.'
+        ),
+        'first_scanned_at': first_scanned_at.isoformat() if first_scanned_at else None,
+        'first_scanned_by': _mask_email(first_email),
+        'scan_count': product.scan_count,
+        'product': {
+            'name': product.product_name,
+            'brand': product.brand,
+            'batch_number': product.batch_number,
+        },
+    })
+
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
+@throttle_classes([CheckThrottle])
 def check_product(request, product_id):
+    if not verify_signature(product_id, request.query_params.get('sig')):
+        return Response(
+            {'status': 'error', 'message': 'Invalid or unsigned QR code.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     try:
         product = Product.objects.get(id=product_id)
     except Product.DoesNotExist:
@@ -130,6 +202,8 @@ def check_product(request, product_id):
             'is_active': product.is_active,
         },
         'scan_status': {
+            'status': product.status,
+            'is_activated': product.status != Product.STATUS_PRINTED and product.is_active,
             'scan_count': product.scan_count,
             'is_verified': product.scan_count > 0,
             'is_suspicious': product.is_suspicious,
@@ -139,20 +213,23 @@ def check_product(request, product_id):
 
 
 @api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
 def scan_list(request):
     scans = ScanRecord.objects.select_related('product').all()
 
-    # Filter by is_first_scan if query param provided
     is_first_scan = request.query_params.get('is_first_scan')
     if is_first_scan is not None:
         is_first_scan = is_first_scan.lower() in ('true', '1', 'yes')
         scans = scans.filter(is_first_scan=is_first_scan)
 
-    serializer = ScanRecordSerializer(scans, many=True)
-    return Response(serializer.data)
+    paginator = StandardPagination()
+    page = paginator.paginate_queryset(scans, request)
+    serializer = ScanRecordSerializer(page, many=True)
+    return paginator.get_paginated_response(serializer.data)
 
 
 @api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
 def dashboard_stats(request):
     total_products = Product.objects.count()
     total_scans = ScanRecord.objects.count()
@@ -162,10 +239,13 @@ def dashboard_stats(request):
     today = timezone.now().date()
     scans_today = ScanRecord.objects.filter(scanned_at__date=today).count()
 
+    # Lifecycle breakdown for the dashboard.
+    status_counts = {row['status']: row['n'] for row in
+                     Product.objects.values('status').annotate(n=Count('id'))}
+
     recent_suspicious = ScanRecord.objects.filter(
         is_first_scan=False
     ).select_related('product').order_by('-scanned_at')[:10]
-
     recent_suspicious_data = ScanRecordSerializer(recent_suspicious, many=True).data
 
     return Response({
@@ -174,26 +254,33 @@ def dashboard_stats(request):
         'genuine_scans': genuine_scans,
         'suspicious_scans': suspicious_scans,
         'scans_today': scans_today,
+        'status_breakdown': {
+            'printed': status_counts.get(Product.STATUS_PRINTED, 0),
+            'active': status_counts.get(Product.STATUS_ACTIVE, 0),
+            'verified': status_counts.get(Product.STATUS_VERIFIED, 0),
+            'flagged': status_counts.get(Product.STATUS_FLAGGED, 0),
+        },
         'recent_suspicious': recent_suspicious_data,
     })
 
 
 @api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
 def fraud_alerts(request):
     suspicious_scans = ScanRecord.objects.filter(
         is_first_scan=False
     ).select_related('product').order_by('-scanned_at')
 
-    serializer = ScanRecordSerializer(suspicious_scans, many=True)
-    return Response(serializer.data)
+    paginator = StandardPagination()
+    page = paginator.paginate_queryset(suspicious_scans, request)
+    serializer = ScanRecordSerializer(page, many=True)
+    return paginator.get_paginated_response(serializer.data)
 
 
 @api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
 def customer_list(request):
-    """
-    List all unique customers grouped by email.
-    Returns: name, email, phone, total_scans, products_verified, first_scan, last_scan
-    """
+    """List unique customers grouped by email with aggregated scan data."""
     customers = (
         ScanRecord.objects
         .values('customer_email')
@@ -206,13 +293,11 @@ def customer_list(request):
         .order_by('-last_scan')
     )
 
-    # Enrich with name and phone from their latest scan
     result = []
     for c in customers:
         latest = ScanRecord.objects.filter(
             customer_email=c['customer_email']
         ).order_by('-scanned_at').first()
-
         result.append({
             'email': c['customer_email'],
             'name': latest.customer_name if latest else '',
@@ -227,10 +312,8 @@ def customer_list(request):
 
 
 @api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
 def customer_detail(request, email):
-    """
-    Get all scan records for a specific customer email.
-    """
     scans = ScanRecord.objects.filter(
         customer_email=email
     ).select_related('product').order_by('-scanned_at')
