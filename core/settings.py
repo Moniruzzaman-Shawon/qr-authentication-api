@@ -218,6 +218,17 @@ TWILIO_ACCOUNT_SID = env.str('TWILIO_ACCOUNT_SID', default='')
 TWILIO_AUTH_TOKEN = env.str('TWILIO_AUTH_TOKEN', default='')
 TWILIO_FROM_NUMBER = env.str('TWILIO_FROM_NUMBER', default='')
 
+# White-label branding — seeds the editable SiteConfig singleton on first run.
+BRAND_APP_NAME = env.str('BRAND_APP_NAME', default='QRShield')
+BRAND_TAGLINE = env.str('BRAND_TAGLINE', default='QR Authentication & Anti-Counterfeit')
+BRAND_COMPANY = env.str('BRAND_COMPANY', default='QRShield')
+BRAND_SUPPORT_EMAIL = env.str('BRAND_SUPPORT_EMAIL', default='support@qrshield.com')
+BRAND_ACCENT = env.str('BRAND_ACCENT', default='#ef4444')
+
+# Login security: lock an account after this many failed attempts, for this long.
+LOGIN_MAX_ATTEMPTS = env.int('LOGIN_MAX_ATTEMPTS', default=5)
+LOGIN_LOCKOUT_MINUTES = env.int('LOGIN_LOCKOUT_MINUTES', default=15)
+
 # Initial admin (seeded by `manage.py seed_admin`).
 INITIAL_ADMIN_USERNAME = env.str('INITIAL_ADMIN_USERNAME', default='admin')
 INITIAL_ADMIN_EMAIL = env.str('INITIAL_ADMIN_EMAIL', default='admin@qrshield.com')

@@ -196,3 +196,21 @@ class ProductExportRecallTests(TestCase):
             f'/api/products/{self.product.id}/', {'is_active': False}, format='json'
         )
         self.assertEqual(r.status_code, 403)
+
+
+class QrPdfTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.operator = make_user('op1', OPERATOR)
+        self.product = Product.objects.create(
+            product_name='Oil', batch_number='B-1', manufactured_date='2026-01-01',
+        )
+
+    def test_pdf_requires_auth(self):
+        self.assertEqual(self.client.get('/api/products/download-qr-pdf/').status_code, 401)
+
+    def test_pdf_404_when_no_qr_images(self):
+        # The product has no generated qr image in this test -> nothing to render.
+        self.client.force_authenticate(self.operator)
+        r = self.client.get('/api/products/download-qr-pdf/')
+        self.assertEqual(r.status_code, 404)

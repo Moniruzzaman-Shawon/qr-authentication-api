@@ -12,6 +12,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
+from accounts.models import log_action
 from accounts.permissions import IsAdmin, IsAdminOrOperator
 from core.pagination import StandardPagination
 from notifications.services import notify_customer_genuine, notify_suspicious_scan
@@ -371,7 +372,9 @@ def scan_detail(request, scan_id):
         scan = ScanRecord.objects.get(id=scan_id)
     except ScanRecord.DoesNotExist:
         return Response({'detail': 'Scan not found.'}, status=status.HTTP_404_NOT_FOUND)
+    label = f'{scan.customer_email} / {scan.product.batch_number if scan.product else "?"}'
     scan.delete()
+    log_action(request, 'scan.delete', target=label)
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -393,7 +396,8 @@ def customer_detail(request, email):
         from accounts.roles import is_admin
         if not is_admin(request.user):
             return Response({'detail': 'Admin role required.'}, status=status.HTTP_403_FORBIDDEN)
-        deleted, _ = scans.delete()
+        scans.delete()
+        log_action(request, 'customer.delete', target=email)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     latest = scans.first()

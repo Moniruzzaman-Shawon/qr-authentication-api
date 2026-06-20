@@ -11,6 +11,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
+from accounts.models import log_action
 from accounts.permissions import IsAdmin, IsAdminOrOperator
 from accounts.roles import is_admin
 from core.pagination import StandardPagination
@@ -285,6 +286,73 @@ def product_export(request):
     return response
 
 
+@api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
+def download_qr_pdf(request):
+    """Render selected QR codes as a print-ready A4 label sheet (PDF).
+
+    Query param `ids` = comma-separated UUIDs; omitted = all products.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    ids = request.query_params.get('ids')
+    base = Product.objects.only('id', 'product_name', 'batch_number', 'qr_code_image')
+    if ids:
+        id_list = [i.strip() for i in ids.split(',') if i.strip()]
+        products = list(base.filter(id__in=id_list))
+    else:
+        products = list(base.all())
+    products = [p for p in products if p.qr_code_image]
+
+    if not products:
+        return Response({'error': 'No QR codes found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    cols, rows = 3, 4
+    per_page = cols * rows
+    margin = 12 * mm
+    cell_w = (width - 2 * margin) / cols
+    cell_h = (height - 2 * margin) / rows
+    qr_size = min(cell_w, cell_h) - 16 * mm
+
+    for idx, p in enumerate(products):
+        pos = idx % per_page
+        if pos == 0 and idx > 0:
+            c.showPage()
+        col, row = pos % cols, pos // cols
+        x = margin + col * cell_w
+        y = height - margin - (row + 1) * cell_h
+
+        try:
+            with p.qr_code_image.open('rb') as f:
+                img = ImageReader(io.BytesIO(f.read()))
+            c.drawImage(
+                img,
+                x + (cell_w - qr_size) / 2,
+                y + (cell_h - qr_size) / 2 + 6 * mm,
+                qr_size, qr_size,
+            )
+        except Exception:
+            continue
+
+        c.setFont('Helvetica-Bold', 8)
+        c.drawCentredString(x + cell_w / 2, y + 10 * mm, (p.product_name or '')[:34])
+        c.setFont('Helvetica', 7)
+        c.drawCentredString(x + cell_w / 2, y + 5.5 * mm, p.batch_number)
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    response = HttpResponse(buffer.read(), content_type='application/pdf')
+    response['Content-Disposition'] = 'attachment; filename="qr_labels.pdf"'
+    return response
+
+
 def _activate(product, user):
     """Transition a single product PRINTED -> ACTIVE. Returns (ok, message)."""
     if product.status != Product.STATUS_PRINTED:
@@ -313,6 +381,7 @@ def activate_product(request, product_id):
             {'status': 'error', 'message': f'Cannot activate: {message}.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    log_action(request, 'product.activate', target=product.batch_number)
     return Response(ProductListSerializer(product).data)
 
 
@@ -367,11 +436,18 @@ def product_detail(request, product_id):
         )
         if serializer.is_valid():
             updated_product = serializer.save()
+            if 'is_active' in request.data:
+                action = 'product.recall' if not updated_product.is_active else 'product.restore'
+                log_action(request, action, target=updated_product.batch_number)
+            else:
+                log_action(request, 'product.update', target=updated_product.batch_number)
             return Response(ProductListSerializer(updated_product).data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     if request.method == 'DELETE':
+        batch = product.batch_number
         product.delete()
+        log_action(request, 'product.delete', target=batch)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
