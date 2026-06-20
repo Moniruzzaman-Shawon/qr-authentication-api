@@ -116,3 +116,135 @@ class ReadEndpointAuthTests(TestCase):
         make_user('op1', OPERATOR)
         self.client.force_authenticate(user=User.objects.get(username='op1'))
         self.assertEqual(self.client.get('/api/stats/').status_code, 200)
+
+
+class ExportAndStatsTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = make_user('admin1', ADMIN)
+        self.operator = make_user('op1', OPERATOR)
+        self.product = Product.objects.create(
+            product_name='Mustard Oil', batch_number='B-1', manufactured_date='2026-01-01',
+        )
+        ScanRecord.objects.create(
+            product=self.product, customer_email='a@x.com', customer_name='A',
+            is_first_scan=True,
+        )
+        ScanRecord.objects.create(
+            product=self.product, customer_email='a@x.com', customer_name='A',
+            is_first_scan=False,
+        )
+
+    def test_scan_export_requires_auth(self):
+        self.assertEqual(self.client.get('/api/scans/export/').status_code, 401)
+
+    def test_pii_export_is_admin_only(self):
+        self.client.force_authenticate(self.operator)
+        self.assertEqual(self.client.get('/api/scans/export/').status_code, 403)
+        self.assertEqual(self.client.get('/api/customers/export/').status_code, 403)
+
+    def test_scan_export_csv(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.get('/api/scans/export/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r['Content-Type'], 'text/csv')
+        self.assertIn('a@x.com', r.content.decode())
+
+    def test_customer_export_csv(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.get('/api/customers/export/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('a@x.com', r.content.decode())
+
+    def test_stats_includes_timeseries(self):
+        self.client.force_authenticate(self.operator)
+        r = self.client.get('/api/stats/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('timeseries', r.data)
+        self.assertEqual(len(r.data['timeseries']), 14)
+        # today's bucket should carry the two scans created above
+        today = r.data['timeseries'][-1]
+        self.assertEqual(today['genuine'], 1)
+        self.assertEqual(today['suspicious'], 1)
+
+
+class FraudAlertTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = make_user('admin1', ADMIN)
+        self.operator = make_user('op1', OPERATOR)
+        # A PRINTED product scanned by a customer -> one suspicious scan, scan_count == 1.
+        self.printed = Product.objects.create(
+            product_name='Brake Fluid', batch_number='B-1', manufactured_date='2026-01-01',
+        )
+        self.before = ScanRecord.objects.create(
+            product=self.printed, customer_email='early@x.com', customer_name='E',
+            customer_phone='123', ip_address='9.9.9.9', is_first_scan=False,
+        )
+        # A genuine + duplicate pair on another product.
+        self.sold = Product.objects.create(
+            product_name='Engine Oil', batch_number='B-2', manufactured_date='2026-01-01',
+            status=Product.STATUS_VERIFIED,
+        )
+        ScanRecord.objects.create(
+            product=self.sold, customer_email='real@x.com', customer_name='R',
+            is_first_scan=True,
+        )
+        self.dup = ScanRecord.objects.create(
+            product=self.sold, customer_email='fake@x.com', customer_name='F',
+            is_first_scan=False,
+        )
+
+    def test_single_scan_before_activation_appears(self):
+        """The bug: a not-activated scan was counted but never shown."""
+        self.client.force_authenticate(self.admin)
+        r = self.client.get('/api/fraud-alerts/')
+        self.assertEqual(r.status_code, 200)
+        emails = {row['customer_email'] for row in r.data['results']}
+        self.assertEqual(len(r.data['results']), 2)
+        self.assertIn('early@x.com', emails)
+
+    def test_alert_types_classified(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.get('/api/fraud-alerts/')
+        by_email = {row['customer_email']: row['alert_type'] for row in r.data['results']}
+        self.assertEqual(by_email['early@x.com'], 'before_activation')
+        self.assertEqual(by_email['fake@x.com'], 'duplicate')
+
+    def test_operator_pii_is_masked(self):
+        self.client.force_authenticate(self.operator)
+        r = self.client.get('/api/fraud-alerts/')
+        row = next(x for x in r.data['results'] if x['alert_type'] == 'before_activation')
+        self.assertNotIn('early@x.com', row['customer_email'])
+        self.assertIn('***', row['customer_email'])
+        self.assertIsNone(row['ip_address'])
+
+    def test_admin_pii_is_visible(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.get('/api/fraud-alerts/')
+        row = next(x for x in r.data['results'] if x['alert_type'] == 'before_activation')
+        self.assertEqual(row['customer_email'], 'early@x.com')
+        self.assertEqual(row['ip_address'], '9.9.9.9')
+
+    def test_admin_can_delete_scan(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.delete(f'/api/scans/{self.dup.id}/')
+        self.assertEqual(r.status_code, 204)
+        self.assertFalse(ScanRecord.objects.filter(id=self.dup.id).exists())
+
+    def test_operator_cannot_delete_scan(self):
+        self.client.force_authenticate(self.operator)
+        r = self.client.delete(f'/api/scans/{self.dup.id}/')
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(ScanRecord.objects.filter(id=self.dup.id).exists())
+
+    def test_admin_can_delete_customer(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.delete('/api/customers/real@x.com/')
+        self.assertEqual(r.status_code, 204)
+        self.assertFalse(ScanRecord.objects.filter(customer_email='real@x.com').exists())
+
+    def test_operator_cannot_delete_customer(self):
+        self.client.force_authenticate(self.operator)
+        r = self.client.delete('/api/customers/real@x.com/')
+        self.assertEqual(r.status_code, 403)

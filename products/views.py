@@ -1,3 +1,4 @@
+import csv
 import io
 import zipfile
 import qrcode
@@ -98,7 +99,7 @@ def bulk_create_products(request):
     catalog_id = request.data.get('catalog')
     catalog = None
     product_name = request.data.get('product_name')
-    brand = request.data.get('brand', 'Rahman Trades Bangladesh')
+    brand = request.data.get('brand', '')
 
     if catalog_id:
         try:
@@ -192,7 +193,7 @@ def bulk_create_csv(request):
     errors = []
     for row_num, row in enumerate(reader, start=2):
         product_name = (row.get('product_name') or '').strip()
-        brand = (row.get('brand') or 'Rahman Trades Bangladesh').strip()
+        brand = (row.get('brand') or '').strip()
         batch_number = (row.get('batch_number') or '').strip()
         manufactured_date = (row.get('manufactured_date') or '').strip()
 
@@ -203,7 +204,7 @@ def bulk_create_csv(request):
         try:
             product = Product.objects.create(
                 product_name=product_name,
-                brand=brand or 'Rahman Trades Bangladesh',
+                brand=brand,
                 batch_number=batch_number,
                 manufactured_date=manufactured_date,
             )
@@ -254,6 +255,33 @@ def download_qr_codes(request):
     zip_buffer.seek(0)
     response = HttpResponse(zip_buffer.read(), content_type='application/zip')
     response['Content-Disposition'] = 'attachment; filename="qr_codes.zip"'
+    return response
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminOrOperator])
+def product_export(request):
+    """Download the product inventory as CSV."""
+    products = _product_qs().order_by('-created_at')
+    response = HttpResponse(content_type='text/csv')
+    response['Content-Disposition'] = 'attachment; filename="inventory.csv"'
+    writer = csv.writer(response)
+    writer.writerow([
+        'Product', 'Brand', 'Batch', 'Manufactured', 'Status',
+        'Scans', 'Active', 'Activated At', 'Created',
+    ])
+    for p in products.iterator():
+        writer.writerow([
+            p.product_name,
+            p.brand,
+            p.batch_number,
+            p.manufactured_date.isoformat() if p.manufactured_date else '',
+            p.get_status_display(),
+            p.scan_count,
+            'Yes' if p.is_active else 'No (recalled)',
+            p.activated_at.isoformat() if p.activated_at else '',
+            p.created_at.isoformat(),
+        ])
     return response
 
 
@@ -325,7 +353,7 @@ def product_detail(request, product_id):
         )
 
     if request.method == 'GET':
-        serializer = ProductDetailSerializer(product)
+        serializer = ProductDetailSerializer(product, context={'request': request})
         return Response(serializer.data)
 
     # Writes (PUT/PATCH/DELETE) are Admin only.

@@ -158,3 +158,41 @@ class CatalogTests(TestCase):
         unit.refresh_from_db()
         self.assertIsNone(unit.catalog)
         self.assertEqual(unit.product_name, 'Wax')  # name preserved
+
+
+class ProductExportRecallTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = make_user('admin1', ADMIN)
+        self.operator = make_user('op1', OPERATOR)
+        self.product = Product.objects.create(
+            product_name='Oil', batch_number='B-1', manufactured_date='2026-01-01',
+        )
+
+    def test_export_requires_auth(self):
+        self.assertEqual(self.client.get('/api/products/export/').status_code, 401)
+
+    def test_export_returns_csv(self):
+        self.client.force_authenticate(self.operator)
+        r = self.client.get('/api/products/export/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r['Content-Type'], 'text/csv')
+        body = r.content.decode()
+        self.assertIn('Product', body)      # header
+        self.assertIn('Oil', body)          # row
+
+    def test_admin_can_recall_via_patch(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.patch(
+            f'/api/products/{self.product.id}/', {'is_active': False}, format='json'
+        )
+        self.assertEqual(r.status_code, 200)
+        self.product.refresh_from_db()
+        self.assertFalse(self.product.is_active)
+
+    def test_operator_cannot_recall(self):
+        self.client.force_authenticate(self.operator)
+        r = self.client.patch(
+            f'/api/products/{self.product.id}/', {'is_active': False}, format='json'
+        )
+        self.assertEqual(r.status_code, 403)

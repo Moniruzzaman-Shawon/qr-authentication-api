@@ -70,3 +70,38 @@ class UserManagementTests(TestCase):
         self.client.force_authenticate(self.admin)
         r = self.client.delete(f'/api/users/{self.admin.id}/')
         self.assertEqual(r.status_code, 400)
+
+
+class ChangePasswordTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = make_user('op1', OPERATOR, password='oldpass12345')
+
+    def test_requires_auth(self):
+        r = self.client.post('/api/auth/change-password/', {}, format='json')
+        self.assertEqual(r.status_code, 401)
+
+    def test_change_password_success(self):
+        self.client.force_authenticate(self.user)
+        r = self.client.post('/api/auth/change-password/', {
+            'current_password': 'oldpass12345', 'new_password': 'brandNew98765',
+        }, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('brandNew98765'))
+
+    def test_wrong_current_password_rejected(self):
+        self.client.force_authenticate(self.user)
+        r = self.client.post('/api/auth/change-password/', {
+            'current_password': 'WRONG', 'new_password': 'brandNew98765',
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('current_password', r.data)
+
+    def test_weak_new_password_rejected(self):
+        self.client.force_authenticate(self.user)
+        r = self.client.post('/api/auth/change-password/', {
+            'current_password': 'oldpass12345', 'new_password': '123',
+        }, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('new_password', r.data)

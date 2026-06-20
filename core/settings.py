@@ -183,8 +183,9 @@ SIMPLE_JWT = {
 }
 
 SPECTACULAR_SETTINGS = {
-    'TITLE': 'QR Authentication API',
-    'DESCRIPTION': 'Product authentication via one-time-use QR codes with two-phase activation.',
+    'TITLE': 'QRShield API',
+    'DESCRIPTION': 'QRShield — QR authentication & anti-counterfeit. Product '
+                   'verification via one-time-use QR codes with two-phase activation.',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
 }
@@ -205,7 +206,7 @@ EMAIL_PORT = env.int('EMAIL_PORT', default=587)
 EMAIL_USE_TLS = env.bool('EMAIL_USE_TLS', default=True)
 EMAIL_HOST_USER = env.str('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = env.str('EMAIL_HOST_PASSWORD', default='')
-DEFAULT_FROM_EMAIL = env.str('DEFAULT_FROM_EMAIL', default='alerts@rahmantraders.com.bd')
+DEFAULT_FROM_EMAIL = env.str('DEFAULT_FROM_EMAIL', default='alerts@qrshield.com')
 
 # Where fraud / not-activated alerts are sent (comma-separated).
 ALERT_RECIPIENT_EMAILS = env.list('ALERT_RECIPIENT_EMAILS', default=[])
@@ -219,7 +220,7 @@ TWILIO_FROM_NUMBER = env.str('TWILIO_FROM_NUMBER', default='')
 
 # Initial admin (seeded by `manage.py seed_admin`).
 INITIAL_ADMIN_USERNAME = env.str('INITIAL_ADMIN_USERNAME', default='admin')
-INITIAL_ADMIN_EMAIL = env.str('INITIAL_ADMIN_EMAIL', default='admin@rahmantraders.com.bd')
+INITIAL_ADMIN_EMAIL = env.str('INITIAL_ADMIN_EMAIL', default='admin@qrshield.com')
 INITIAL_ADMIN_PASSWORD = env.str('INITIAL_ADMIN_PASSWORD', default='')
 
 # ---------------------------------------------------------------------------

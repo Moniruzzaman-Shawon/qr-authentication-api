@@ -10,7 +10,7 @@ class CatalogProduct(models.Model):
     chosen catalog entry so the name is selected, never re-typed.
     """
     name = models.CharField(max_length=255)
-    brand = models.CharField(max_length=255, default='Rahman Trades Bangladesh')
+    brand = models.CharField(max_length=255, blank=True, default='')
     description = models.TextField(blank=True, default='')
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -53,7 +53,7 @@ class Product(models.Model):
     # Denormalised copies taken from the catalog at creation time (kept so
     # verification and historical records stay stable even if the catalog changes).
     product_name = models.CharField(max_length=255)
-    brand = models.CharField(max_length=255, default='Rahman Trades Bangladesh')
+    brand = models.CharField(max_length=255, blank=True, default='')
     batch_number = models.CharField(max_length=100)
     manufactured_date = models.DateField()
     qr_code_image = models.ImageField(upload_to='qr_codes/', blank=True, null=True)

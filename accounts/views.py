@@ -1,4 +1,6 @@
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
@@ -43,6 +45,33 @@ def logout_view(request):
 @permission_classes([IsAuthenticated])
 def me_view(request):
     return Response(UserSerializer(request.user).data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def change_password_view(request):
+    """Let the signed-in user change their own password.
+
+    Body: {current_password, new_password}. The current password must match,
+    and the new one is run through Django's password validators.
+    """
+    current = request.data.get('current_password') or ''
+    new = request.data.get('new_password') or ''
+    user = request.user
+
+    if not user.check_password(current):
+        return Response(
+            {'current_password': 'Current password is incorrect.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        validate_password(new, user)
+    except DjangoValidationError as exc:
+        return Response({'new_password': list(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new)
+    user.save(update_fields=['password'])
+    return Response({'detail': 'Password updated successfully.'})
 
 
 @api_view(['GET', 'POST'])

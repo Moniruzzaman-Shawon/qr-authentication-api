@@ -83,6 +83,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     def get_scan_records(self, obj):
         from authentication.serializers import ScanRecordSerializer
         # select_related('product') so the serializer's product_* fields don't
-        # fire one query per scan row.
+        # fire one query per scan row. Pass context through so PII masking for
+        # operators applies here too.
         records = obj.scan_records.select_related('product').all()
-        return ScanRecordSerializer(records, many=True).data
+        return ScanRecordSerializer(records, many=True, context=self.context).data
